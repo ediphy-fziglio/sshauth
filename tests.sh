@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs sshauth against the fake server in server.py.
+# Runs sshauth against the fake server in server.py, then against sshauthd.
 #
 # Usage: ./tests.sh   (or: make check)
 #
@@ -114,6 +114,73 @@ rm -f t.sock
 timeout 10 ./client true >out 2>err
 rc=$?
 check "no server listening" 255 "" "connect t.sock"
+
+# The real server, built from cmd/sshauthd. It serves every connection,
+# so it is started once for all the tests below.
+rm -f t.sock
+(cd "$SRC" && go build -buildvcs=false -o "$TMP/sshauthd" ./cmd/sshauthd) || exit 1
+./sshauthd -socket t.sock 2>sshauthd.log &
+srv=$!
+for _ in $(seq 100); do
+    [ -S t.sock ] && break
+    sleep 0.05
+done
+
+# srun STDIN ARGS...: like run, against sshauthd.
+srun() {
+    local input=$1
+    shift
+    printf '%s' "$input" | timeout 10 ./client "$@" >out 2>err
+    rc=$?
+}
+
+srun $'hello\nworld\n' tr a-z A-Z
+check "sshauthd: stdin and stdout are forwarded" 0 $'HELLO\nWORLD' ""
+
+srun "" sh -c 'echo out; echo err >&2; exit 7'
+check "sshauthd: stderr and exit code" 7 "out" "^err$"
+
+srun "abc" cat
+check "sshauthd: EOF on stdin reaches the command" 0 "abc" ""
+
+srun "" sh -c 'echo "[$0]"' 'a b'
+check "sshauthd: argument with a space stays one argument" 0 "[a b]" ""
+
+srun "" head -c 1000000 /dev/zero
+if [ "$rc" = 0 ] && [ "$(wc -c <out)" = 1000000 ]; then
+    ok "sshauthd: large output is not lost on EXIT"
+else
+    not_ok "sshauthd: large output is not lost on EXIT" "rc=$rc, $(wc -c <out) bytes"
+fi
+
+srun "" sh -c 'head -c 5000 /dev/zero | tr "\0" e >&2'
+if [ "$rc" = 0 ] && [ "$(wc -c <err)" = 5000 ]; then
+    ok "sshauthd: stderr longer than one TEXT message"
+else
+    not_ok "sshauthd: stderr longer than one TEXT message" "rc=$rc, $(wc -c <err) bytes"
+fi
+
+srun "" sh -c 'kill -9 $$'
+check "sshauthd: killed by a signal" 137 "" ""
+
+srun "" nosuchcommand
+check "sshauthd: unknown command gives ERR!" 1 "" "nosuchcommand"
+
+srun ""
+check "sshauthd: empty command gives ERR!" 1 "" "^empty command$"
+
+# The client must not wait for its stdin to close once EXIT arrives.
+start=$SECONDS
+timeout 10 ./client true < <(sleep 5) >out 2>err
+rc=$?
+if [ "$rc" = 0 ] && [ $((SECONDS - start)) -lt 5 ]; then
+    ok "sshauthd: EXIT without EOF on stdin"
+else
+    not_ok "sshauthd: EXIT without EOF on stdin" "rc=$rc after $((SECONDS - start))s"
+fi
+
+kill "$srv"
+wait "$srv" 2>/dev/null
 
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
