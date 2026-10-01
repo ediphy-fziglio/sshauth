@@ -2,6 +2,7 @@
  * sshauth: run a command through the sshauth unix socket.
  *
  * Request:  "SSHA" | u16 version (1) | u16 len | command line (len <= 4096)
+ *           where the command line is argv[1..] separated by single NUL bytes
  * Reply:    "ERR!" | u16 len | message (len <= 1024)          -> exit 1
  *           "OKAY" + errfd passed with SCM_RIGHTS
  * Then stdin -> socket, socket -> stdout, and errfd carries:
@@ -132,7 +133,7 @@ static int recv_tag(int sock, unsigned char tag[4])
     return fd;
 }
 
-/* Builds the command line: argv[1..] joined by single spaces. */
+/* Builds the command line: argv[1..] separated by single NUL bytes. */
 static size_t build_cmd(int argc, char **argv, char *out)
 {
     size_t len = 0;
@@ -143,7 +144,7 @@ static size_t build_cmd(int argc, char **argv, char *out)
             exit(EXIT_LOCAL);
         }
         if (i > 1)
-            out[len++] = ' ';
+            out[len++] = '\0';
         memcpy(out + len, argv[i], strlen(argv[i]));
         len += strlen(argv[i]);
     }
@@ -244,15 +245,9 @@ int main(int argc, char **argv)
         { sock, POLLIN, 0 },
         { errfd, POLLIN, 0 },
     };
-    int exited = 0;
     int32_t code = 0;
 
-    /*
-     * ASSUMPTION: the EXIT message can arrive before the last command
-     * output on the socket, so after EXIT we keep copying the socket to
-     * stdout until the server closes it, and stop reading stdin.
-     */
-    while (fds[1].fd >= 0 || (!exited && fds[2].fd >= 0)) {
+    while (fds[1].fd >= 0 || fds[2].fd >= 0) {
         if (poll(fds, 3, -1) < 0) {
             if (errno == EINTR)
                 continue;
@@ -293,15 +288,24 @@ int main(int argc, char **argv)
             } else if (n > 0) {
                 elen += (size_t)n;
                 if (handle_err_msgs(&code)) {
-                    exited = 1;
-                    fds[0].fd = -1;
-                    fds[2].fd = -1;
+                    /*
+                     * Output the server sent before EXIT is already queued
+                     * on the socket: copy it out without waiting for more.
+                     */
+                    struct pollfd sp = { sock, POLLIN, 0 };
+                    while (fds[1].fd >= 0 && poll(&sp, 1, 0) > 0) {
+                        ssize_t m = read(sock, buf, sizeof(buf));
+                        if (m <= 0)
+                            break;
+                        write_all(STDOUT_FILENO, buf, (size_t)m);
+                    }
+                    close(sock);
+                    close(errfd);
+                    exit(code);
                 }
             }
         }
     }
 
-    if (!exited)
-        die_proto("connection closed without EXIT");
-    return code;
+    die_proto("connection closed without EXIT");
 }
