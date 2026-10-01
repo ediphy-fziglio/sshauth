@@ -138,15 +138,15 @@ static size_t build_cmd(int argc, char **argv, char *out)
 {
     size_t len = 0;
     for (int i = 1; i < argc; i++) {
-        size_t n = strlen(argv[i]) + (i > 1);
-        if (len + n > MAX_CMD) {
+        size_t arg_len = strlen(argv[i]);
+        if (len + arg_len + (i > 1) > MAX_CMD) {
             fprintf(stderr, "sshauth: command line longer than %d bytes\n", MAX_CMD);
             exit(EXIT_LOCAL);
         }
         if (i > 1)
             out[len++] = '\0';
-        memcpy(out + len, argv[i], strlen(argv[i]));
-        len += strlen(argv[i]);
+        memcpy(out + len, argv[i], arg_len);
+        len += arg_len;
     }
     return len;
 }
@@ -190,14 +190,14 @@ static int handle_err_msgs(int32_t *code)
 
 int main(int argc, char **argv)
 {
-    static char cmd[MAX_CMD];
     unsigned char hdr[8];
     unsigned char tag[4];
     char buf[16384];
+    _Static_assert(sizeof(buf) >= MAX_CMD, "buf must hold the command line");
 
     signal(SIGPIPE, SIG_IGN);
 
-    size_t cmd_len = build_cmd(argc, argv, cmd);
+    size_t cmd_len = build_cmd(argc, argv, buf);
 
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock < 0)
@@ -213,7 +213,7 @@ int main(int argc, char **argv)
     hdr[6] = (unsigned char)(cmd_len >> 8);
     hdr[7] = (unsigned char)cmd_len;
     write_all(sock, hdr, sizeof(hdr));
-    write_all(sock, cmd, cmd_len);
+    write_all(sock, buf, cmd_len);
 
     int errfd = recv_tag(sock, tag);
     if (memcmp(tag, "ERR!", 4) == 0) {
