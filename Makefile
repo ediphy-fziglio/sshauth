@@ -8,7 +8,10 @@ sshauth: sshauth.c
 install: sshauth
 	install -D -m 755 sshauth $(DESTDIR)$(PREFIX)/bin/sshauth
 
+check: sshauth
+	./tests.sh
+
 clean:
 	rm -f sshauth
 
-.PHONY: install clean
+.PHONY: install check clean
