@@ -41,8 +41,8 @@ const (
 // rejects the request, and the error text is sent to the client.
 //
 // Placeholder: allows everything.
-func validate(cred *syscall.Ucred, args []string) error {
-	return nil
+func validate(cred *syscall.Ucred, args []string) ([]string, error) {
+	return args, nil
 }
 
 func main() {
@@ -85,7 +85,7 @@ func serve(conn *net.UnixConn) error {
 	if len(args) == 0 {
 		return sendErr(conn, "empty command")
 	}
-	if err := validate(cred, args); err != nil {
+	if args, err = validate(cred, args); err != nil {
 		return sendErr(conn, err.Error())
 	}
 
