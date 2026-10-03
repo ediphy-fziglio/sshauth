@@ -15,35 +15,49 @@
 package main
 
 import (
-	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
-	"os/exec"
-	"strings"
+	"regexp"
+	"sshauth/cmd/sshauthd/proto"
 	"syscall"
-	"time"
-)
-
-const (
-	maxCmd  = 4096
-	maxMsg  = 1024
-	version = 1
-	// Time allowed for the client to send its request.
-	requestTimeout = 10 * time.Second
 )
 
 // validate decides whether the peer may run args. Returning an error
 // rejects the request, and the error text is sent to the client.
-//
-// Placeholder: allows everything.
 func validate(cred *syscall.Ucred, args []string) ([]string, error) {
-	return args, nil
+	if len(args) != 3 {
+		return nil, fmt.Errorf("expected 3 arguments, got %d", len(args))
+	}
+	if args[0] != "git@github.com" {
+		return nil, errors.New("wrong user/server")
+	}
+	switch args[1] {
+	case "git-upload-pack", "git-receive-pack":
+	default:
+		return nil, fmt.Errorf("command not allowed %q", args[1])
+	}
+	args[2] = shellUnquote(args[2])
+	if !safeArg.MatchString(args[2]) {
+		return nil, fmt.Errorf("invalid argument %q", args[2])
+	}
+	args[2] = fmt.Sprintf("'%s'", args[2])
+	return append([]string{"ssh"}, args...), nil
 }
+
+func shellUnquote(s string) string {
+	if len(s) < 2 || s[0] != s[len(s)-1] || (s[0] != '\'' && s[0] != '"') {
+		return s
+	}
+	return s[1 : len(s)-1]
+}
+
+// safeArg matches a non-empty string of [A-Za-z0-9._/-] not starting
+// with "-", so it can't be taken as an option.
+var safeArg = regexp.MustCompile(`^[A-Za-z0-9._/][A-Za-z0-9._/-]*$`)
 
 func main() {
 	sockPath := flag.String("socket", "/root/.ssh/sshauth.sock", "unix socket to listen on")
@@ -64,204 +78,9 @@ func main() {
 		}
 		go func() {
 			defer conn.Close()
-			if err := serve(conn); err != nil {
+			if err := proto.Serve(conn, validate); err != nil {
 				log.Print(err)
 			}
 		}()
-	}
-}
-
-func serve(conn *net.UnixConn) error {
-	cred, err := peerCred(conn)
-	if err != nil {
-		return err
-	}
-	args, err := readRequest(conn)
-	if err != nil {
-		return fmt.Errorf("pid %d uid %d: %w", cred.Pid, cred.Uid, err)
-	}
-	log.Printf("pid %d uid %d: %q", cred.Pid, cred.Uid, args)
-
-	if len(args) == 0 {
-		return sendErr(conn, "empty command")
-	}
-	if args, err = validate(cred, args); err != nil {
-		return sendErr(conn, err.Error())
-	}
-
-	// The command gets plain pipes rather than the socket itself: its
-	// output must not reach the socket before OKAY, and a dup of the
-	// socket would be non-blocking, which commands don't expect.
-	inR, inW, err := os.Pipe()
-	if err != nil {
-		return err
-	}
-	outR, outW, err := os.Pipe()
-	if err != nil {
-		closeAll(inR, inW)
-		return err
-	}
-	errR, errW, err := os.Pipe()
-	if err != nil {
-		closeAll(inR, inW, outR, outW)
-		return err
-	}
-	defer closeAll(inW, outR, errR)
-
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = inR, outW, errW
-	err = cmd.Start()
-	closeAll(inR, outW, errW)
-	if err != nil {
-		return sendErr(conn, err.Error())
-	}
-
-	errfd, err := sendOkay(conn)
-	if err != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
-		return err
-	}
-	defer errfd.Close()
-
-	// stdin: runs until the client sends EOF or the socket is closed.
-	go func() {
-		io.Copy(inW, conn)
-		inW.Close()
-	}()
-
-	outDone := make(chan struct{})
-	go func() {
-		defer close(outDone)
-		if _, err := io.Copy(conn, outR); err != nil {
-			// The client is gone: stop the command, and keep
-			// draining in case something else holds the pipe.
-			cmd.Process.Kill()
-			io.Copy(io.Discard, outR)
-		}
-	}()
-
-	// stderr is copied here; a failed write to errfd only stops the
-	// copying, the command keeps running and its stderr is dropped.
-	buf := make([]byte, 6+maxMsg)
-	copy(buf, "TEXT")
-	errfdOK := true
-	for {
-		n, err := errR.Read(buf[6:])
-		if n > 0 && errfdOK {
-			binary.BigEndian.PutUint16(buf[4:], uint16(n))
-			if _, werr := errfd.Write(buf[:6+n]); werr != nil {
-				errfdOK = false
-			}
-		}
-		if err != nil {
-			break
-		}
-	}
-	<-outDone
-
-	code := exitCode(cmd.Wait())
-	msg := make([]byte, 8)
-	copy(msg, "EXIT")
-	binary.BigEndian.PutUint32(msg[4:], uint32(code))
-	if _, err := errfd.Write(msg); err != nil {
-		return fmt.Errorf("pid %d: sending EXIT: %w", cred.Pid, err)
-	}
-	return nil
-}
-
-func peerCred(conn *net.UnixConn) (*syscall.Ucred, error) {
-	raw, err := conn.SyscallConn()
-	if err != nil {
-		return nil, err
-	}
-	var cred *syscall.Ucred
-	var credErr error
-	err = raw.Control(func(fd uintptr) {
-		cred, credErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
-	})
-	if err == nil {
-		err = credErr
-	}
-	return cred, err
-}
-
-// readRequest reads "SSHA" | u16 version | u16 len | command line and
-// returns the arguments, which the command line separates with NUL.
-func readRequest(conn *net.UnixConn) ([]string, error) {
-	conn.SetReadDeadline(time.Now().Add(requestTimeout))
-	defer conn.SetReadDeadline(time.Time{})
-
-	var hdr [8]byte
-	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-		return nil, fmt.Errorf("reading request: %w", err)
-	}
-	if string(hdr[:4]) != "SSHA" {
-		return nil, errors.New("bad request magic")
-	}
-	if v := binary.BigEndian.Uint16(hdr[4:]); v != version {
-		return nil, fmt.Errorf("unsupported version %d", v)
-	}
-	n := binary.BigEndian.Uint16(hdr[6:])
-	if n > maxCmd {
-		return nil, fmt.Errorf("command line of %d bytes", n)
-	}
-	if n == 0 {
-		return nil, nil
-	}
-	line := make([]byte, n)
-	if _, err := io.ReadFull(conn, line); err != nil {
-		return nil, fmt.Errorf("reading command line: %w", err)
-	}
-	return strings.Split(string(line), "\x00"), nil
-}
-
-// sendErr replies "ERR!" | u16 len | msg, truncating msg to maxMsg bytes.
-func sendErr(conn *net.UnixConn, msg string) error {
-	if len(msg) > maxMsg {
-		msg = msg[:maxMsg]
-	}
-	buf := make([]byte, 6, 6+len(msg))
-	copy(buf, "ERR!")
-	binary.BigEndian.PutUint16(buf[4:], uint16(len(msg)))
-	_, err := conn.Write(append(buf, msg...))
-	return err
-}
-
-// sendOkay creates a socketpair, replies "OKAY" passing one end to the
-// client and returns the other one.
-func sendOkay(conn *net.UnixConn) (*os.File, error) {
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return nil, os.NewSyscallError("socketpair", err)
-	}
-	defer syscall.Close(fds[1])
-	errfd := os.NewFile(uintptr(fds[0]), "errfd")
-	if _, _, err := conn.WriteMsgUnix([]byte("OKAY"), syscall.UnixRights(fds[1]), nil); err != nil {
-		errfd.Close()
-		return nil, err
-	}
-	return errfd, nil
-}
-
-// exitCode returns the command's exit code, or 128 + the signal number
-// when a signal killed it, as shells do.
-func exitCode(err error) int32 {
-	var ee *exec.ExitError
-	if err == nil {
-		return 0
-	}
-	if !errors.As(err, &ee) {
-		return 255
-	}
-	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-		return 128 + int32(ws.Signal())
-	}
-	return int32(ee.ExitCode())
-}
-
-func closeAll(files ...*os.File) {
-	for _, f := range files {
-		f.Close()
 	}
 }
