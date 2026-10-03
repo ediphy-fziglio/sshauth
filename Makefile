@@ -8,7 +8,7 @@ all: sshauth sshauthd
 sshauth: sshauth.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
-sshauthd: go.mod $(wildcard cmd/sshauthd/*.go)
+sshauthd: go.mod $(wildcard cmd/sshauthd/*.go sshauthproto/*.go)
 	$(GO) build -o $@ ./cmd/sshauthd
 
 install: sshauth sshauthd

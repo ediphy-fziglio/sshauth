@@ -1,4 +1,4 @@
-package proto
+package sockcmdproto
 
 // For each connection it reads the request, validates it and starts the
 // command. If either step fails it replies "ERR!". Otherwise it replies

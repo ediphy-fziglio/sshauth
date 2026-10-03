@@ -22,8 +22,9 @@ import (
 	"net"
 	"os"
 	"regexp"
-	"sshauth/cmd/sshauthd/proto"
 	"syscall"
+
+	"github.com/ediphy-fziglio/sshauth/sockcmdproto"
 )
 
 // validate decides whether the peer may run args. Returning an error
@@ -78,7 +79,7 @@ func main() {
 		}
 		go func() {
 			defer conn.Close()
-			if err := proto.Serve(conn, validate); err != nil {
+			if err := sockcmdproto.Serve(conn, validate); err != nil {
 				log.Print(err)
 			}
 		}()
